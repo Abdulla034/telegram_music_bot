@@ -58,64 +58,69 @@ async def init_db():
         await db.execute(CREATE_SQL)
         await db.commit()
 
+
+# ====== YENİ: Cookies-siz və sabit işləyən versiya ======
 def download_track(query: str):
     """
-    YouTube/YouTube Music-də axtarır, ən uyğun nəticəni MP3 kimi çıxarır.
+    Cookies tələb etməyən versiya.
+    Əvvəl SoundCloud-da axtarır, sonra ehtiyat üçün auto rejimdən istifadə edir.
     Geri: (mp3_path, title, artist, tmpdir)
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
     outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
 
-    ydl_opts = {
+    common_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
-        "default_search": "ytsearch5",      # daha stabil
         "geo_bypass": True,
         "source_address": "0.0.0.0",
+        "sleep_requests": 1.0,
+        "retries": 2,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
             {"key": "FFmpegMetadata"},
         ],
     }
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=False)
+    def try_search(default_search: str):
+        opts = dict(common_opts)
+        opts["default_search"] = default_search
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=False)
 
-        # ytsearch nəticəsidirsə entries-lərdən seç
-        if info.get("_type") == "playlist":
-            entries = [e for e in info.get("entries", []) if e]
-            if not entries:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                raise RuntimeError("axtarış nəticəsi tapılmadı")
+            if info.get("_type") == "playlist":
+                entries = [e for e in info.get("entries", []) if e]
+                if not entries:
+                    raise RuntimeError("axtarış nəticəsi tapılmadı")
+                chosen = entries[0]
+            else:
+                chosen = info
 
-            # 15s-12dq aralığında olanları saxla
-            filtered = []
-            for e in entries:
-                dur = (e.get("duration") or 0)
-                if 15 <= dur <= 12 * 60:
-                    filtered.append(e)
-            if not filtered:
-                filtered = entries
+            info2 = ydl.extract_info(chosen["webpage_url"], download=True)
+            title = info2.get("title")
+            artist = info2.get("artist") or info2.get("uploader") or ""
+            base = ydl.prepare_filename(info2)
+            mp3_path = os.path.splitext(base)[0] + ".mp3"
 
-            chosen = filtered[0]
-        else:
-            chosen = info
+            if not os.path.exists(mp3_path):
+                raise RuntimeError("ffmpeg və ya fayl çıxarma xətası")
+            return mp3_path, title, artist
 
-        # Seçilən videonu yüklə
-        info2 = ydl.extract_info(chosen["webpage_url"], download=True)
-        title = info2.get("title")
-        artist = info2.get("artist") or info2.get("uploader") or ""
-
-        base = ydl.prepare_filename(info2)
-        mp3_path = os.path.splitext(base)[0] + ".mp3"
-
-        if not os.path.exists(mp3_path):
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            raise RuntimeError("ffmpeg və ya fayl çıxarma xətası")
-
+    try:
+        mp3_path, title, artist = try_search("scsearch5")  # SoundCloud
         return mp3_path, title, artist, tmpdir
+    except Exception:
+        try:
+            mp3_path, title, artist = try_search("auto")  # ehtiyat rejim
+            return mp3_path, title, artist, tmpdir
+        except Exception as e:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError(f"Axtarış zamanı xəta: {e}")
+# ==========================================================
+
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -131,9 +136,8 @@ async def on_query(m: Message):
     try:
         file_path, title, artist, tmpdir = await asyncio.to_thread(download_track, query)
     except Exception as e:
-        # Loglarda dəqiq səbəbi görmək üçün:
         print(f"[download_track error] {e}")
-        await wait.edit_text("Tapmaq mümkün olmadı. ❌  (yt-dlp/ffmpeg və ya nəticə yoxdur)")
+        await wait.edit_text("Tapmaq mümkün olmadı. ❌  (fərqli adla yenidən yoxla)")
         return
 
     caption = (
@@ -143,7 +147,6 @@ async def on_query(m: Message):
         f"👤 Göndərən: @{m.from_user.username or m.from_user.id}"
     )
 
-    # Faylı ilk adminə göndər, file_id götür
     first_admin = ADMIN_IDS[0]
     try:
         msg = await bot.send_audio(first_admin, FSInputFile(file_path), caption=caption)
@@ -165,7 +168,6 @@ async def on_query(m: Message):
         cur = await db.execute("SELECT last_insert_rowid()")
         sub_id = (await cur.fetchone())[0]
 
-    # Adminlərə mesaj (hamısına PM)
     for admin_id in ADMIN_IDS:
         with suppress(Exception):
             await bot.send_audio(
