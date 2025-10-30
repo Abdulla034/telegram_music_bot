@@ -1,0 +1,46 @@
+# === Python cache & temp ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+*.sqlite3
+*.db
+*.tmp
+*.temp
+*.pid
+*.bak
+
+# === Environment & secrets ===
+.env
+*.env
+*.b64
+cookies.txt
+cookies.b64
+.env.local
+.env.production
+config.json
+
+# === Virtual environment ===
+venv/
+env/
+.venv/
+
+# === OS & editor files ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# === Build & distribution ===
+build/
+dist/
+*.egg-info/
+*.egg
+
+# === Heroku & deployment ===
+*.tar.gz
+*.zip
+*.bak
+submissions.db
