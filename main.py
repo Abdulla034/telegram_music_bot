@@ -97,75 +97,63 @@ def download_track(query: str):
             return None
 
     def ytdlp_try(url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
-    cookies_path = build_cookiefile()
-    common_opts = {
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "noplaylist": True,
-        "geo_bypass": True,
-        "nocheckcertificate": True,
-        "allow_unplayable_formats": False,
-        "http_headers": {"User-Agent": "Mozilla/5.0"},
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-            {"key": "FFmpegMetadata"},
-        ],
-    }
-    if cookies_path:
-        common_opts["cookiefile"] = cookies_path
+        cookies_path = build_cookiefile()
+        common_opts = {
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "noplaylist": True,
+            "geo_bypass": True,
+            "nocheckcertificate": True,
+            "allow_unplayable_formats": False,
+            "http_headers": {"User-Agent": "Mozilla/5.0"},
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+                {"key": "FFmpegMetadata"},
+            ],
+        }
+        if cookies_path:
+            common_opts["cookiefile"] = cookies_path
 
-    # 1) Öncədən PROBE: formatları çıxar, audio-only varmı?
-    probe_opts = dict(common_opts)
-    probe_opts["skip_download"] = True
-    probe_opts["format"] = "bestaudio/best"
+        probe_opts = dict(common_opts)
+        probe_opts["skip_download"] = True
+        probe_opts["format"] = "bestaudio/best"
 
-    with YoutubeDL(probe_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        with YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    # Shorts/şəkil tipini atla
-    if not info or ("shorts/" in (info.get("webpage_url") or "")):
-        raise RuntimeError("Uyğun olmayan nəticə (shorts və ya səhifə)")
+        if not info or ("shorts/" in (info.get("webpage_url") or "")):
+            raise RuntimeError("Uyğun olmayan nəticə (shorts və ya səhifə)")
 
-    fmts = info.get("formats") or []
-    # Audio-only formatlar
-    audio_only = [f for f in fmts
-                  if (f.get("vcodec") in (None, "none")) and (f.get("acodec") and f.get("acodec") != "none")]
+        fmts = info.get("formats") or []
+        audio_only = [f for f in fmts if (f.get("vcodec") in (None, "none")) and (f.get("acodec") and f.get("acodec") != "none")]
 
-    if not audio_only:
-        # Heç olmasa audio+səsli kombinə baxaq
-        audio_like = [f for f in fmts if f.get("acodec") and f.get("acodec") != "none"]
-        if not audio_like:
-            raise RuntimeError("Audio format tapılmadı")
+        if not audio_only:
+            audio_like = [f for f in fmts if f.get("acodec") and f.get("acodec") != "none"]
+            if not audio_like:
+                raise RuntimeError("Audio format tapılmadı")
+            best = max(audio_like, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
+        else:
+            best = max(audio_only, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
 
-        # audio+səsli içindən ən yüksək abr-li
-        best = max(audio_like, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
-    else:
-        # Audio-only içindən ən yaxşısı (abr üstün)
-        best = max(audio_only, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
+        forced_format_id = best.get("format_id")
+        if not forced_format_id:
+            raise RuntimeError("Format ID tapılmadı")
 
-    forced_format_id = best.get("format_id")
-    if not forced_format_id:
-        raise RuntimeError("Format ID tapılmadı")
+        dl_opts = dict(common_opts)
+        dl_opts["format"] = f"{forced_format_id}"
 
-    # 2) REAL YÜKLƏMƏ: seçdiyimiz format_id-a məcbur et
-    dl_opts = dict(common_opts)
-    dl_opts["format"] = f"{forced_format_id}"
+        with YoutubeDL(dl_opts) as ydl:
+            ydl.download([url])
 
-    with YoutubeDL(dl_opts) as ydl:
-        ydl.download([url])
-
-    # MP3 çıxışını tap
-    def find_mp3_path_local() -> str:
         for name in os.listdir(tmpdir):
             if name.lower().endswith(".mp3"):
-                return os.path.join(tmpdir, name)
-        return ""
-    mp3_path = find_mp3_path_local()
-    if not mp3_path:
-        raise RuntimeError("MP3 faylı yaradılmadı")
+                mp3_path = os.path.join(tmpdir, name)
+                break
+        else:
+            raise RuntimeError("MP3 faylı yaradılmadı")
 
-    return mp3_path, title_fallback, author_fallback, tmpdir
+        return mp3_path, title_fallback, author_fallback, tmpdir
 
     # 1) PROXY varsa
     if PROXY_API_URL:
