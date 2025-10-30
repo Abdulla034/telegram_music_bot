@@ -77,7 +77,9 @@ def download_mp3(video_url: str) -> Tuple[str, str, str, int]:
 async def start_handler(_, m: Message):
     await m.reply("Salam! /song ilə mahnı adını yaz, mən tapıb MP3 göndərim 🎧\n\n" + HELP_TEXT, quote=True)
 
-@app.on_message(filters.command(["song"], prefixes=["/", "!"]) & (filters.private | filters.group) & ~filters.edited)
+@Medusa.on_message(
+    filters.command(['song'], prefixes=['/', '!'])
+    & (filters.group | filters.private))
 async def song_handler(_, m: Message):
     if len(m.command) == 1:
         return await m.reply(HELP_TEXT, quote=True)
