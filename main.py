@@ -1,4 +1,5 @@
 import os
+import base64
 import asyncio
 import aiosqlite
 import tempfile
@@ -17,10 +18,10 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 # İstəyə bağlı: Öz Heroku proxy API-nin URL-i (məs: https://sənin-proxy.herokuapp.com)
 PROXY_API_URL = os.getenv("PROXY_API_URL", "").strip()
 
-# YouTube blokunu keçmək üçün Base64 kodlanmış cookies (Netscape formatı)
+# Cookie-lər (Kiwi → cookies.txt → base64 → COOKIES_B64)
 COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
 
-# Bir neçə admin (vergüllə ayrılmış ID-lər, məsələn "123,456")
+# Bir neçə admin üçün (vergüllə ayrılmış ID-lər)
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_IDS:
@@ -65,28 +66,29 @@ async def init_db():
         await db.execute(CREATE_SQL)
         await db.commit()
 
-# -----------------------------------------------------------
-# Mahnını tapıb MP3 çıxaran stabil funksiya (proxy → piped/invidious → ytsearch5)
-# -----------------------------------------------------------
+# ---- COOKIES_B64 → müvəqqəti cookie faylı
+def build_cookiefile(tmpdir: str) -> str | None:
+    if not COOKIES_B64:
+        return None
+    try:
+        path = os.path.join(tmpdir, "cookies.txt")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(COOKIES_B64))
+        return path
+    except Exception as e:
+        print(f"[cookies decode error] {e}")
+        return None
+
+# ---- Mahnını tapıb MP3 çıxaran funksiya
 def download_track(query: str):
     """
-    1) PROXY_API_URL varsa: <proxy>/api/search?query=...
-    2) Piped/Invidious instansları (JSON deyilsə atla)
-    3) Son çarə: yt-dlp 'ytsearch5:'
-    • COOKIES_B64 varsa – hər iki yükləmədə istifadə olunur (YouTube blokunu keçir)
+    1) PROXY varsa: <proxy>/api/search?query=...
+    2) Piped/Invidious JSON instansları
+    3) Son çarə: yt-dlp 'ytsearch5:' (cookie varsa onu da veririk)
     Geri: (mp3_path, title, artist, tmpdir)
     """
-    import base64
-
     tmpdir = tempfile.mkdtemp(prefix="track_")
     outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
-
-    # cookies.txt hazırlığı (əgər COOKIES_B64 var)
-    cookie_path = None
-    if COOKIES_B64:
-        cookie_path = os.path.join(tmpdir, "cookies.txt")
-        with open(cookie_path, "wb") as f:
-            f.write(base64.b64decode(COOKIES_B64))
 
     def find_mp3_path() -> str:
         for name in os.listdir(tmpdir):
@@ -95,23 +97,25 @@ def download_track(query: str):
         return ""
 
     def ytdlp_from_url(video_url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
+        cookies_path = build_cookiefile(tmpdir)
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
             "quiet": True,
             "noplaylist": True,
             "geo_bypass": True,
+            "nocheckcertificate": True,
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
                 {"key": "FFmpegMetadata"},
             ],
+            # Cookie faylı varsa yt-dlp-yə ötür
+            **({"cookiefile": cookies_path} if cookies_path else {}),
+            # YouTube-a qarşı daha stabil olmaq üçün UA
+            "http_headers": {"User-Agent": "Mozilla/5.0"},
         }
-        if cookie_path:
-            ydl_opts["cookiefile"] = cookie_path
-
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-
         mp3_path = find_mp3_path()
         if not mp3_path:
             raise RuntimeError("MP3 faylı yaradılmadı")
@@ -133,7 +137,7 @@ def download_track(query: str):
         except Exception as e:
             print(f"[PROXY ERROR] {e}")
 
-    # 2) Piped / Invidious instansları
+    # 2) Piped / Invidious
     SOURCES = [
         ("piped", "https://piped.video"),
         ("piped", "https://pipedapi.kavin.rocks"),
@@ -173,8 +177,9 @@ def download_track(query: str):
             print(f"[{base}] xətası: {e}")
             continue
 
-    # 3) Son çarə: birbaşa yt-dlp axtarışı (ytsearch5)
+    # 3) Son çarə: yt-dlp birbaşa axtarış
     try:
+        cookies_path = build_cookiefile(tmpdir)
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
@@ -182,21 +187,20 @@ def download_track(query: str):
             "quiet": True,
             "default_search": "ytsearch5",
             "geo_bypass": True,
+            "nocheckcertificate": True,
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
                 {"key": "FFmpegMetadata"},
             ],
+            **({"cookiefile": cookies_path} if cookies_path else {}),
+            "http_headers": {"User-Agent": "Mozilla/5.0"},
         }
-        if cookie_path:
-            ydl_opts["cookiefile"] = cookie_path
-
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(query, download=True)
             if info.get("_type") == "playlist" and info.get("entries"):
                 info = info["entries"][0]
             title = info.get("title") or "Naməlum Mahnı"
             artist = info.get("artist") or info.get("uploader") or "Naməlum"
-
         mp3_path = find_mp3_path()
         if not mp3_path:
             raise RuntimeError("MP3 faylı çıxmadı")
@@ -232,7 +236,6 @@ async def on_query(m: Message):
         f"👤 Göndərən: @{m.from_user.username or m.from_user.id}"
     )
 
-    # Faylı ilk adminə göndər, file_id götür
     first_admin = ADMIN_IDS[0]
     try:
         msg = await bot.send_audio(first_admin, FSInputFile(file_path), caption=caption)
@@ -245,7 +248,6 @@ async def on_query(m: Message):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # DB-yə yaz
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO submissions (user_id, username, query, file_id, title, artist) VALUES (?, ?, ?, ?, ?, ?)",
@@ -255,7 +257,6 @@ async def on_query(m: Message):
         cur = await db.execute("SELECT last_insert_rowid()")
         sub_id = (await cur.fetchone())[0]
 
-    # bütün adminlərə PM
     for admin_id in ADMIN_IDS:
         with suppress(Exception):
             await bot.send_audio(
@@ -303,8 +304,6 @@ async def on_moderate(cb: CallbackQuery):
                 await cb.message.edit_caption(cb.message.caption + "\n❌ Rədd edildi")
             with suppress(Exception):
                 await bot.send_message(sub.user_id, "❌ Təəssüf, tövsiyəniz rədd edildi.")
-
-# ----------------------- Runner -----------------------
 
 async def main():
     await init_db()
