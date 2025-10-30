@@ -14,6 +14,9 @@ from yt_dlp import YoutubeDL
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
+# İstəyə bağlı: Öz Heroku proxy API-nin URL-i (məs: https://music-proxy-az.herokuapp.com)
+PROXY_API_URL = os.getenv("PROXY_API_URL", "").strip()
+
 # Bir neçə admin üçün (vergüllə ayrılmış ID-lər, məsələn "123456789,987654321")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
@@ -60,15 +63,57 @@ async def init_db():
         await db.commit()
 
 
-# ✅ Ən son stabil versiya — 4 alternativ API ilə işləyir
+# ✅ Stabil versiya: 1) PROXY API varsa onu istifadə et; 2) olmazsa 4 alternativ mənbəyə düş
 def download_track(query: str):
     """
-    YouTube və alternativ serverlərdən cookies-siz musiqi axtarır və yükləyir.
-    4 mənbə: piped.video, pipedapi.kavin.rocks, piped.mha.fi, invidious.snopyta.org
+    Cookies-siz musiqi axtarışı və yükləmə.
+    1) PROXY_API_URL varsa: <proxy>/api/search?query=...
+    2) Əks halda 4 mənbə: piped.video, pipedapi.kavin.rocks, piped.mha.fi, invidious.snopyta.org
+    Geri: (mp3_path, title, artist, tmpdir)
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
     outtmpl = os.path.join(tmpdir, "audio.mp3")
 
+    def ytdlp_download(video_url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "noplaylist": True,
+            "geo_bypass": True,
+            "source_address": "0.0.0.0",
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+                {"key": "FFmpegMetadata"},
+            ],
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+        if not os.path.exists(outtmpl):
+            raise RuntimeError("MP3 faylı yaradılmadı")
+        return outtmpl, title_fallback, author_fallback
+
+    # 1) PROXY API cəhdi
+    if PROXY_API_URL:
+        try:
+            api = PROXY_API_URL.rstrip("/") + "/api/search"
+            url = f"{api}?query={requests.utils.quote(query)}"
+            r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            if r.ok:
+                j = r.json()
+                if "url" in j:
+                    print(f"[PROXY OK] {j.get('source','')}")
+                    return ytdlp_download(
+                        j["url"],
+                        j.get("title", "Naməlum Mahnı"),
+                        j.get("author", "Naməlum")
+                    )
+            else:
+                print(f"[PROXY FAIL] status={r.status_code}")
+        except Exception as e:
+            print(f"[PROXY ERROR] {e}")
+
+    # 2) Fallback: açıq mənbələr
     SOURCES = [
         "https://piped.video",
         "https://pipedapi.kavin.rocks",
@@ -78,21 +123,31 @@ def download_track(query: str):
 
     video = None
     video_url = None
+    title = "Naməlum Mahnı"
+    author = "Naməlum"
+
     for base_url in SOURCES:
         try:
             if "invidious" in base_url:
-                resp = requests.get(f"{base_url}/api/v1/search?q={query}", timeout=10)
+                resp = requests.get(
+                    f"{base_url}/api/v1/search?q={requests.utils.quote(query)}",
+                    timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+                )
             else:
-                resp = requests.get(f"{base_url}/api/v1/search?q={query}&filter=music", timeout=10)
+                resp = requests.get(
+                    f"{base_url}/api/v1/search?q={requests.utils.quote(query)}&filter=music",
+                    timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+                )
             if resp.status_code == 200 and resp.json():
                 data = resp.json()
                 video = data[0] if isinstance(data, list) else data
+                title = video.get("title") or title
+                author = video.get("uploader") or video.get("author") or author
                 video_url = (
                     f"https://youtube.com/watch?v={video.get('videoId')}"
-                    if "videoId" in video
-                    else f"{base_url}{video['url']}"
+                    if "videoId" in video else f"{base_url}{video['url']}"
                 )
-                print(f"[OK] Tapıldı: {video_url}")
+                print(f"[FALLBACK OK] {video_url}")
                 break
         except Exception as e:
             print(f"[{base_url}] xətası: {e}")
@@ -100,36 +155,14 @@ def download_track(query: str):
 
     if not video or not video_url:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("Mahnı tapılmadı — bütün mənbələr uğursuz oldu")
+        raise RuntimeError("Mahnı tapılmadı — proxy və bütün mənbələr uğursuz oldu")
 
-    title = video.get("title") or "Naməlum Mahnı"
-    author = video.get("uploader") or video.get("author") or "Naməlum"
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "noplaylist": True,
-        "geo_bypass": True,
-        "source_address": "0.0.0.0",
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-            {"key": "FFmpegMetadata"},
-        ],
-    }
-
+    # Yüklə
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+        return ytdlp_download(video_url, title, author)
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError(f"Mahnı yüklənmədi: {e}")
-
-    if not os.path.exists(outtmpl):
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("MP3 faylı yaradılmadı")
-
-    return outtmpl, title, author, tmpdir
 
 
 @dp.message(CommandStart())
