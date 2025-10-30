@@ -60,11 +60,11 @@ async def init_db():
         await db.commit()
 
 
-# ✅ Yeni stabil versiya — 3 alternativ mənbədən mahnı tapır
+# ✅ Ən son stabil versiya — 4 alternativ API ilə işləyir
 def download_track(query: str):
     """
-    YouTube videolarını cookies-siz alternativ API-lərdən tapır və yükləyir.
-    3 fərqli piped serveri sınayır.
+    YouTube və alternativ serverlərdən cookies-siz musiqi axtarır və yükləyir.
+    4 mənbə: piped.video, pipedapi.kavin.rocks, piped.mha.fi, invidious.snopyta.org
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
     outtmpl = os.path.join(tmpdir, "audio.mp3")
@@ -72,28 +72,38 @@ def download_track(query: str):
     SOURCES = [
         "https://piped.video",
         "https://pipedapi.kavin.rocks",
-        "https://piped.mha.fi"
+        "https://piped.mha.fi",
+        "https://invidious.snopyta.org"
     ]
 
     video = None
+    video_url = None
     for base_url in SOURCES:
         try:
-            resp = requests.get(f"{base_url}/api/v1/search?q={query}&filter=music", timeout=10)
+            if "invidious" in base_url:
+                resp = requests.get(f"{base_url}/api/v1/search?q={query}", timeout=10)
+            else:
+                resp = requests.get(f"{base_url}/api/v1/search?q={query}&filter=music", timeout=10)
             if resp.status_code == 200 and resp.json():
-                video = resp.json()[0]
-                video_url = f"{base_url}{video['url']}"
+                data = resp.json()
+                video = data[0] if isinstance(data, list) else data
+                video_url = (
+                    f"https://youtube.com/watch?v={video.get('videoId')}"
+                    if "videoId" in video
+                    else f"{base_url}{video['url']}"
+                )
                 print(f"[OK] Tapıldı: {video_url}")
                 break
         except Exception as e:
             print(f"[{base_url}] xətası: {e}")
             continue
 
-    if not video:
+    if not video or not video_url:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError("Mahnı tapılmadı — bütün mənbələr uğursuz oldu")
 
-    title = video.get("title")
-    author = video.get("uploader") or "Naməlum"
+    title = video.get("title") or "Naməlum Mahnı"
+    author = video.get("uploader") or video.get("author") or "Naməlum"
 
     ydl_opts = {
         "format": "bestaudio/best",
