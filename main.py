@@ -14,7 +14,7 @@ from yt_dlp import YoutubeDL
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
-# İstəyə bağlı: Öz Heroku proxy API-nin URL-i (məs: https://music-proxy-az.herokuapp.com)
+# İstəyə bağlı: Öz Heroku proxy API-nin URL-i (məs: https://sənin-proxy.herokuapp.com)
 PROXY_API_URL = os.getenv("PROXY_API_URL", "").strip()
 
 # Bir neçə admin üçün (vergüllə ayrılmış ID-lər, məsələn "123456789,987654321")
@@ -62,26 +62,32 @@ async def init_db():
         await db.execute(CREATE_SQL)
         await db.commit()
 
-
-# ✅ Stabil versiya: 1) PROXY API varsa onu istifadə et; 2) olmazsa alternativ mənbələrə düş
+# -----------------------------------------------------------
+# Mahnını tapıb MP3 çıxaran stabil funksiya (proxy → piped/invidious → ytsearch5)
+# -----------------------------------------------------------
 def download_track(query: str):
     """
-    Cookies-siz musiqi axtarışı və yükləmə.
     1) PROXY_API_URL varsa: <proxy>/api/search?query=...
-    2) Əks halda açıq Piped/Invidious instansları.
+    2) Piped/Invidious instansları (JSON deyilsə atla)
+    3) Son çarə: yt-dlp 'ytsearch5:' (cookies/proxy tələb etmir)
     Geri: (mp3_path, title, artist, tmpdir)
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
-    outtmpl = os.path.join(tmpdir, "audio.mp3")
+    outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
 
-    def ytdlp_download(video_url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
+    def find_mp3_path() -> str:
+        for name in os.listdir(tmpdir):
+            if name.lower().endswith(".mp3"):
+                return os.path.join(tmpdir, name)
+        return ""
+
+    def ytdlp_from_url(video_url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
             "quiet": True,
             "noplaylist": True,
             "geo_bypass": True,
-            "source_address": "0.0.0.0",
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
                 {"key": "FFmpegMetadata"},
@@ -89,11 +95,12 @@ def download_track(query: str):
         }
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-        if not os.path.exists(outtmpl):
+        mp3_path = find_mp3_path()
+        if not mp3_path:
             raise RuntimeError("MP3 faylı yaradılmadı")
-        return outtmpl, title_fallback, author_fallback
+        return mp3_path, title_fallback, author_fallback, tmpdir
 
-    # 1) PROXY API cəhdi
+    # 1) PROXY
     if PROXY_API_URL:
         try:
             api = PROXY_API_URL.rstrip("/") + "/api/search"
@@ -103,17 +110,13 @@ def download_track(query: str):
                 j = r.json()
                 if "url" in j:
                     print(f"[PROXY OK] {j.get('source','')}")
-                    return ytdlp_download(
-                        j["url"],
-                        j.get("title", "Naməlum Mahnı"),
-                        j.get("author", "Naməlum")
-                    )
+                    return ytdlp_from_url(j["url"], j.get("title","Naməlum Mahnı"), j.get("author","Naməlum"))
             else:
                 print(f"[PROXY FAIL] status={r.status_code}")
         except Exception as e:
             print(f"[PROXY ERROR] {e}")
 
-    # 2) Fallback: açıq mənbələr (JSON deyilsə növbəti instansa keç)
+    # 2) Piped / Invidious instansları
     SOURCES = [
         ("piped", "https://piped.video"),
         ("piped", "https://pipedapi.kavin.rocks"),
@@ -121,23 +124,19 @@ def download_track(query: str):
         ("invidious", "https://iv.ggtyler.dev"),
         ("invidious", "https://yewtu.be"),
     ]
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-    video = None
-    video_url = None
-    title = "Naməlum Mahnı"
-    author = "Naməlum"
-
-    for typ, base_url in SOURCES:
+    for typ, base in SOURCES:
         try:
             if typ == "invidious":
-                req_url = f"{base_url}/api/v1/search?q={requests.utils.quote(query)}"
+                req = f"{base}/api/v1/search?q={requests.utils.quote(query)}"
             else:
-                req_url = f"{base_url}/api/v1/search?q={requests.utils.quote(query)}&filter=music"
+                req = f"{base}/api/v1/search?q={requests.utils.quote(query)}&filter=music"
 
-            resp = requests.get(req_url, timeout=10, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            resp = requests.get(req, timeout=10, headers=headers)
             ct = resp.headers.get("content-type", "")
             if not resp.ok or "application/json" not in ct.lower():
-                print(f"[{base_url}] JSON deyil və ya status {resp.status_code}")
+                print(f"[{base}] JSON deyil və ya status {resp.status_code}")
                 continue
 
             data = resp.json()
@@ -145,29 +144,47 @@ def download_track(query: str):
             if not item:
                 continue
 
-            title = item.get("title") or title
-            author = item.get("uploader") or item.get("author") or author
+            title = item.get("title") or "Naməlum Mahnı"
+            artist = item.get("uploader") or item.get("author") or "Naməlum"
             video_url = (
                 f"https://youtube.com/watch?v={item.get('videoId')}"
-                if "videoId" in item else f"{base_url}{item.get('url')}"
+                if "videoId" in item else f"{base}{item.get('url')}"
             )
             print(f"[FALLBACK OK] {video_url}")
-            break
+            return ytdlp_from_url(video_url, title, artist)
         except Exception as e:
-            print(f"[{base_url}] xətası: {e}")
+            print(f"[{base}] xətası: {e}")
             continue
 
-    if not video_url:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("Mahnı tapılmadı — proxy və bütün mənbələr uğursuz oldu")
-
-    # Yüklə
+    # 3) Son çarə: birbaşa yt-dlp axtarışı (ytsearch5)
     try:
-        return ytdlp_download(video_url, title, author)
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "default_search": "ytsearch5",
+            "geo_bypass": True,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+                {"key": "FFmpegMetadata"},
+            ],
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=True)
+            if info.get("_type") == "playlist" and info.get("entries"):
+                info = info["entries"][0]
+            title = info.get("title") or "Naməlum Mahnı"
+            artist = info.get("artist") or info.get("uploader") or "Naməlum"
+        mp3_path = find_mp3_path()
+        if not mp3_path:
+            raise RuntimeError("MP3 faylı çıxmadı")
+        return mp3_path, title, artist, tmpdir
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError(f"Mahnı yüklənmədi: {e}")
+        raise RuntimeError(f"Mahnı tapılmadı — bütün mənbələr uğursuz oldu: {e}")
 
+# ----------------------- Handlers -----------------------
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -215,6 +232,7 @@ async def on_query(m: Message):
         cur = await db.execute("SELECT last_insert_rowid()")
         sub_id = (await cur.fetchone())[0]
 
+    # bütün adminlərə PM
     for admin_id in ADMIN_IDS:
         with suppress(Exception):
             await bot.send_audio(
@@ -227,7 +245,6 @@ async def on_query(m: Message):
             )
 
     await wait.edit_text("Tövsiyəniz adminlərə göndərildi ✅")
-
 
 @dp.callback_query(F.from_user.id.in_(ADMIN_IDS), F.data.startswith(("approve:", "reject:")))
 async def on_moderate(cb: CallbackQuery):
@@ -264,11 +281,11 @@ async def on_moderate(cb: CallbackQuery):
             with suppress(Exception):
                 await bot.send_message(sub.user_id, "❌ Təəssüf, tövsiyəniz rədd edildi.")
 
+# ----------------------- Runner -----------------------
 
 async def main():
     await init_db()
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
