@@ -1,5 +1,4 @@
 import os
-import base64
 import asyncio
 import aiosqlite
 import tempfile
@@ -18,10 +17,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 # İstəyə bağlı: Öz Heroku proxy API-nin URL-i (məs: https://sənin-proxy.herokuapp.com)
 PROXY_API_URL = os.getenv("PROXY_API_URL", "").strip()
 
-# Cookie-lər (Kiwi → cookies.txt → base64 → COOKIES_B64)
-COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
-
-# Bir neçə admin üçün (vergüllə ayrılmış ID-lər)
+# Bir neçə admin üçün (vergüllə ayrılmış ID-lər, məsələn "123456789,987654321")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_IDS:
@@ -66,25 +62,14 @@ async def init_db():
         await db.execute(CREATE_SQL)
         await db.commit()
 
-# ---- COOKIES_B64 → müvəqqəti cookie faylı
-def build_cookiefile(tmpdir: str) -> str | None:
-    if not COOKIES_B64:
-        return None
-    try:
-        path = os.path.join(tmpdir, "cookies.txt")
-        with open(path, "wb") as f:
-            f.write(base64.b64decode(COOKIES_B64))
-        return path
-    except Exception as e:
-        print(f"[cookies decode error] {e}")
-        return None
-
-# ---- Mahnını tapıb MP3 çıxaran funksiya
+# -----------------------------------------------------------
+# MAHNI YÜKLƏMƏ — Proxy → Piped/Invidious → YouTube axtarış (filtr + fallback)
+# -----------------------------------------------------------
 def download_track(query: str):
     """
-    1) PROXY varsa: <proxy>/api/search?query=...
-    2) Piped/Invidious JSON instansları
-    3) Son çarə: yt-dlp 'ytsearch5:' (cookie varsa onu da veririk)
+    1) PROXY_API_URL varsa: <proxy>/api/search?query=...
+    2) Piped/Invidious instansları (yalnız JSON cavablıları qəbul edir)
+    3) Son çarə: yt-dlp 'ytsearch10' — nəticələri filtrlə (15s–12dq, shorts deyil) və bir-bir yoxla
     Geri: (mp3_path, title, artist, tmpdir)
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
@@ -96,32 +81,52 @@ def download_track(query: str):
                 return os.path.join(tmpdir, name)
         return ""
 
-    def ytdlp_from_url(video_url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
-        cookies_path = build_cookiefile(tmpdir)
+    def build_cookiefile() -> str | None:
+        # Termux-da yaratdığın cookies.b64 dəyərini Heroku-da Config Vars → COOKIES_B64 kimi qoysan, buradan oxunacaq
+        b64 = os.getenv("COOKIES_B64", "").strip()
+        if not b64:
+            return None
+        p = os.path.join(tmpdir, "cookies.txt")
+        try:
+            import base64
+            with open(p, "wb") as f:
+                f.write(base64.b64decode(b64))
+            return p
+        except Exception as e:
+            print(f"[cookies decode error] {e}")
+            return None
+
+    def ytdlp_try(url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
+        cookies_path = build_cookiefile()
         ydl_opts = {
-            "format": "bestaudio/best",
+            # Audio öncə m4a/webm seç, sonra best
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": outtmpl,
             "quiet": True,
             "noplaylist": True,
             "geo_bypass": True,
             "nocheckcertificate": True,
+            "allow_unplayable_formats": False,
+            "http_headers": {"User-Agent": "Mozilla/5.0"},
+            # YouTube 400/invalid argument üçün client fallback
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
                 {"key": "FFmpegMetadata"},
             ],
-            # Cookie faylı varsa yt-dlp-yə ötür
-            **({"cookiefile": cookies_path} if cookies_path else {}),
-            # YouTube-a qarşı daha stabil olmaq üçün UA
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
         }
+        if cookies_path:
+            ydl_opts["cookiefile"] = cookies_path
+
         with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+            ydl.download([url])
+
         mp3_path = find_mp3_path()
         if not mp3_path:
             raise RuntimeError("MP3 faylı yaradılmadı")
         return mp3_path, title_fallback, author_fallback, tmpdir
 
-    # 1) PROXY
+    # 1) PROXY varsa
     if PROXY_API_URL:
         try:
             api = PROXY_API_URL.rstrip("/") + "/api/search"
@@ -131,13 +136,13 @@ def download_track(query: str):
                 j = r.json()
                 if "url" in j:
                     print(f"[PROXY OK] {j.get('source','')}")
-                    return ytdlp_from_url(j["url"], j.get("title","Naməlum Mahnı"), j.get("author","Naməlum"))
+                    return ytdlp_try(j["url"], j.get("title","Naməlum Mahnı"), j.get("author","Naməlum"))
             else:
                 print(f"[PROXY FAIL] status={r.status_code}")
         except Exception as e:
             print(f"[PROXY ERROR] {e}")
 
-    # 2) Piped / Invidious
+    # 2) Piped / Invidious instansları
     SOURCES = [
         ("piped", "https://piped.video"),
         ("piped", "https://pipedapi.kavin.rocks"),
@@ -157,7 +162,7 @@ def download_track(query: str):
             resp = requests.get(req, timeout=10, headers=headers)
             ct = resp.headers.get("content-type", "")
             if not resp.ok or "application/json" not in ct.lower():
-                print(f"[{base}] JSON deyil və ya status {resp.status_code}")
+                print(f"[{base}] JSON deyil və/ya status {resp.status_code}")
                 continue
 
             data = resp.json()
@@ -171,40 +176,66 @@ def download_track(query: str):
                 f"https://youtube.com/watch?v={item.get('videoId')}"
                 if "videoId" in item else f"{base}{item.get('url')}"
             )
-            print(f"[FALLBACK OK] {video_url}")
-            return ytdlp_from_url(video_url, title, artist)
+            if "shorts/" in video_url:  # Shorts-ları atla
+                continue
+            return ytdlp_try(video_url, title, artist)
         except Exception as e:
             print(f"[{base}] xətası: {e}")
             continue
 
-    # 3) Son çarə: yt-dlp birbaşa axtarış
+    # 3) Son çarə: birbaşa YouTube axtarışı — nəticələri filtrlə və sırayla yoxla
     try:
-        cookies_path = build_cookiefile(tmpdir)
-        ydl_opts = {
-            "format": "bestaudio/best",
+        cookies_path = build_cookiefile()
+        search_opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": outtmpl,
             "noplaylist": True,
             "quiet": True,
-            "default_search": "ytsearch5",
+            "default_search": "ytsearch10",
             "geo_bypass": True,
             "nocheckcertificate": True,
+            "http_headers": {"User-Agent": "Mozilla/5.0"},
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
                 {"key": "FFmpegMetadata"},
             ],
-            **({"cookiefile": cookies_path} if cookies_path else {}),
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
         }
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=True)
-            if info.get("_type") == "playlist" and info.get("entries"):
-                info = info["entries"][0]
-            title = info.get("title") or "Naməlum Mahnı"
-            artist = info.get("artist") or info.get("uploader") or "Naməlum"
-        mp3_path = find_mp3_path()
-        if not mp3_path:
-            raise RuntimeError("MP3 faylı çıxmadı")
-        return mp3_path, title, artist, tmpdir
+        if cookies_path:
+            search_opts["cookiefile"] = cookies_path
+
+        with YoutubeDL(search_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+
+        entries = []
+        if info:
+            if info.get("_type") == "playlist":
+                entries = [e for e in info.get("entries", []) if e]
+            else:
+                entries = [info]
+
+        # Filtr: 15s–12dq, URL-də shorts olmasın
+        candidates = []
+        for e in entries:
+            dur = (e.get("duration") or 0)
+            url = e.get("webpage_url") or e.get("url") or ""
+            if 15 <= dur <= 12 * 60 and "shorts/" not in url:
+                candidates.append(e)
+        if not candidates:
+            candidates = entries  # heç nə düşmədinsə, hamısını cəhd et
+
+        last_err = None
+        for e in candidates:
+            try:
+                url = e.get("webpage_url") or e.get("url")
+                title = e.get("title") or "Naməlum Mahnı"
+                artist = e.get("artist") or e.get("uploader") or "Naməlum"
+                return ytdlp_try(url, title, artist)
+            except Exception as ex:
+                last_err = ex
+                continue
+
+        raise RuntimeError(last_err or "Uyğun format tapılmadı")
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError(f"Mahnı tapılmadı — bütün mənbələr uğursuz oldu: {e}")
@@ -257,6 +288,7 @@ async def on_query(m: Message):
         cur = await db.execute("SELECT last_insert_rowid()")
         sub_id = (await cur.fetchone())[0]
 
+    # bütün adminlərə PM
     for admin_id in ADMIN_IDS:
         with suppress(Exception):
             await bot.send_audio(
@@ -304,6 +336,8 @@ async def on_moderate(cb: CallbackQuery):
                 await cb.message.edit_caption(cb.message.caption + "\n❌ Rədd edildi")
             with suppress(Exception):
                 await bot.send_message(sub.user_id, "❌ Təəssüf, tövsiyəniz rədd edildi.")
+
+# ----------------------- Runner -----------------------
 
 async def main():
     await init_db()
