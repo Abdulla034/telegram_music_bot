@@ -1,0 +1,32 @@
+{
+  "name": "Telegram Music Recommendation Bot (PM to Admins)",
+  "description": "İstifadəçi mahnının adını yazır, bot YouTube-dan yükləyib adminlərin PM-inə göndərir. Qəbul olunarsa kanala paylaşılır.",
+  "keywords": ["telegram", "aiogram", "yt-dlp", "music", "bot"],
+  "website": "https://t.me/<your_bot_username>",
+  "repository": "https://github.com/Abdulla034/telegram_music_bot",
+  "env": {
+    "BOT_TOKEN": {
+      "description": "BotFather-dan aldığın Telegram bot token",
+      "required": true
+    },
+    "CHANNEL_ID": {
+      "description": "Kanalın rəqəmli ID-si (məs: -1001234567890). Bota kanalda admin icazəsi verilməlidir.",
+      "required": true
+    },
+    "ADMIN_IDS": {
+      "description": "Adminlərin Telegram user ID-ləri, vergüllə ayrılmış (məs: 123456789,987654321). Adminlərə PM göndəriləcək.",
+      "required": true
+    }
+  },
+  "buildpacks": [
+    { "url": "heroku/python" },
+    { "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest" }
+  ],
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  },
+  "stack": "heroku-22"
+}
