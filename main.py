@@ -3,6 +3,7 @@ import asyncio
 import aiosqlite
 import tempfile
 import shutil
+import requests
 from dataclasses import dataclass
 from contextlib import suppress
 from aiogram import Bot, Dispatcher, F
@@ -59,67 +60,57 @@ async def init_db():
         await db.commit()
 
 
-# ====== YENİ: Cookies-siz və sabit işləyən versiya ======
+# ✅ Yeni versiya: cookies-siz və YouTube-un alternativ API-si ilə
 def download_track(query: str):
     """
-    Cookies tələb etməyən versiya.
-    Əvvəl SoundCloud-da axtarır, sonra ehtiyat üçün auto rejimdən istifadə edir.
-    Geri: (mp3_path, title, artist, tmpdir)
+    Cookies tələb etmir. YouTube videolarını piped.video API ilə tapır və yükləyir.
+    Heroku-da sabit işləyir.
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
-    outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
+    outtmpl = os.path.join(tmpdir, "audio.mp3")
 
-    common_opts = {
+    # piped.video API ilə axtarış
+    search_url = f"https://piped.video/api/v1/search?q={query}&filter=music"
+    resp = requests.get(search_url, timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError("Axtarış zamanı xəta baş verdi")
+
+    results = resp.json()
+    if not results:
+        raise RuntimeError("Mahnı tapılmadı")
+
+    # İlk nəticəni götür
+    video = results[0]
+    video_url = f"https://piped.video{video['url']}"
+    title = video.get("title")
+    author = video.get("uploader") or "Naməlum"
+
+    # yt-dlp ilə yükləmə
+    ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
-        "noplaylist": True,
         "quiet": True,
+        "noplaylist": True,
         "geo_bypass": True,
         "source_address": "0.0.0.0",
-        "sleep_requests": 1.0,
-        "retries": 2,
-        "http_headers": {"User-Agent": "Mozilla/5.0"},
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
             {"key": "FFmpegMetadata"},
         ],
     }
 
-    def try_search(default_search: str):
-        opts = dict(common_opts)
-        opts["default_search"] = default_search
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-
-            if info.get("_type") == "playlist":
-                entries = [e for e in info.get("entries", []) if e]
-                if not entries:
-                    raise RuntimeError("axtarış nəticəsi tapılmadı")
-                chosen = entries[0]
-            else:
-                chosen = info
-
-            info2 = ydl.extract_info(chosen["webpage_url"], download=True)
-            title = info2.get("title")
-            artist = info2.get("artist") or info2.get("uploader") or ""
-            base = ydl.prepare_filename(info2)
-            mp3_path = os.path.splitext(base)[0] + ".mp3"
-
-            if not os.path.exists(mp3_path):
-                raise RuntimeError("ffmpeg və ya fayl çıxarma xətası")
-            return mp3_path, title, artist
-
     try:
-        mp3_path, title, artist = try_search("scsearch5")  # SoundCloud
-        return mp3_path, title, artist, tmpdir
-    except Exception:
-        try:
-            mp3_path, title, artist = try_search("auto")  # ehtiyat rejim
-            return mp3_path, title, artist, tmpdir
-        except Exception as e:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            raise RuntimeError(f"Axtarış zamanı xəta: {e}")
-# ==========================================================
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError(f"Mahnı yüklənmədi: {e}")
+
+    if not os.path.exists(outtmpl):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("MP3 faylı yaradılmadı")
+
+    return outtmpl, title, author, tmpdir
 
 
 @dp.message(CommandStart())
@@ -181,6 +172,7 @@ async def on_query(m: Message):
 
     await wait.edit_text("Tövsiyəniz adminlərə göndərildi ✅")
 
+
 @dp.callback_query(F.from_user.id.in_(ADMIN_IDS), F.data.startswith(("approve:", "reject:")))
 async def on_moderate(cb: CallbackQuery):
     action, sub_id_str = cb.data.split(":")
@@ -216,9 +208,11 @@ async def on_moderate(cb: CallbackQuery):
             with suppress(Exception):
                 await bot.send_message(sub.user_id, "❌ Təəssüf, tövsiyəniz rədd edildi.")
 
+
 async def main():
     await init_db()
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
