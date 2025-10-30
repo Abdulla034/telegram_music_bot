@@ -63,12 +63,12 @@ async def init_db():
         await db.commit()
 
 
-# ✅ Stabil versiya: 1) PROXY API varsa onu istifadə et; 2) olmazsa 4 alternativ mənbəyə düş
+# ✅ Stabil versiya: 1) PROXY API varsa onu istifadə et; 2) olmazsa alternativ mənbələrə düş
 def download_track(query: str):
     """
     Cookies-siz musiqi axtarışı və yükləmə.
     1) PROXY_API_URL varsa: <proxy>/api/search?query=...
-    2) Əks halda 4 mənbə: piped.video, pipedapi.kavin.rocks, piped.mha.fi, invidious.snopyta.org
+    2) Əks halda açıq Piped/Invidious instansları.
     Geri: (mp3_path, title, artist, tmpdir)
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
@@ -113,12 +113,13 @@ def download_track(query: str):
         except Exception as e:
             print(f"[PROXY ERROR] {e}")
 
-    # 2) Fallback: açıq mənbələr
+    # 2) Fallback: açıq mənbələr (JSON deyilsə növbəti instansa keç)
     SOURCES = [
-        "https://piped.video",
-        "https://pipedapi.kavin.rocks",
-        "https://piped.mha.fi",
-        "https://invidious.snopyta.org"
+        ("piped", "https://piped.video"),
+        ("piped", "https://pipedapi.kavin.rocks"),
+        ("piped", "https://piped.mha.fi"),
+        ("invidious", "https://iv.ggtyler.dev"),
+        ("invidious", "https://yewtu.be"),
     ]
 
     video = None
@@ -126,34 +127,37 @@ def download_track(query: str):
     title = "Naməlum Mahnı"
     author = "Naməlum"
 
-    for base_url in SOURCES:
+    for typ, base_url in SOURCES:
         try:
-            if "invidious" in base_url:
-                resp = requests.get(
-                    f"{base_url}/api/v1/search?q={requests.utils.quote(query)}",
-                    timeout=10, headers={"User-Agent": "Mozilla/5.0"}
-                )
+            if typ == "invidious":
+                req_url = f"{base_url}/api/v1/search?q={requests.utils.quote(query)}"
             else:
-                resp = requests.get(
-                    f"{base_url}/api/v1/search?q={requests.utils.quote(query)}&filter=music",
-                    timeout=10, headers={"User-Agent": "Mozilla/5.0"}
-                )
-            if resp.status_code == 200 and resp.json():
-                data = resp.json()
-                video = data[0] if isinstance(data, list) else data
-                title = video.get("title") or title
-                author = video.get("uploader") or video.get("author") or author
-                video_url = (
-                    f"https://youtube.com/watch?v={video.get('videoId')}"
-                    if "videoId" in video else f"{base_url}{video['url']}"
-                )
-                print(f"[FALLBACK OK] {video_url}")
-                break
+                req_url = f"{base_url}/api/v1/search?q={requests.utils.quote(query)}&filter=music"
+
+            resp = requests.get(req_url, timeout=10, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            ct = resp.headers.get("content-type", "")
+            if not resp.ok or "application/json" not in ct.lower():
+                print(f"[{base_url}] JSON deyil və ya status {resp.status_code}")
+                continue
+
+            data = resp.json()
+            item = data[0] if isinstance(data, list) and data else (data if data else None)
+            if not item:
+                continue
+
+            title = item.get("title") or title
+            author = item.get("uploader") or item.get("author") or author
+            video_url = (
+                f"https://youtube.com/watch?v={item.get('videoId')}"
+                if "videoId" in item else f"{base_url}{item.get('url')}"
+            )
+            print(f"[FALLBACK OK] {video_url}")
+            break
         except Exception as e:
             print(f"[{base_url}] xətası: {e}")
             continue
 
-    if not video or not video_url:
+    if not video_url:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError("Mahnı tapılmadı — proxy və bütün mənbələr uğursuz oldu")
 
