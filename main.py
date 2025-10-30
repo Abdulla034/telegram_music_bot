@@ -17,7 +17,10 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 # İstəyə bağlı: Öz Heroku proxy API-nin URL-i (məs: https://sənin-proxy.herokuapp.com)
 PROXY_API_URL = os.getenv("PROXY_API_URL", "").strip()
 
-# Bir neçə admin üçün (vergüllə ayrılmış ID-lər, məsələn "123456789,987654321")
+# YouTube blokunu keçmək üçün Base64 kodlanmış cookies (Netscape formatı)
+COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
+
+# Bir neçə admin (vergüllə ayrılmış ID-lər, məsələn "123,456")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_IDS:
@@ -69,11 +72,21 @@ def download_track(query: str):
     """
     1) PROXY_API_URL varsa: <proxy>/api/search?query=...
     2) Piped/Invidious instansları (JSON deyilsə atla)
-    3) Son çarə: yt-dlp 'ytsearch5:' (cookies/proxy tələb etmir)
+    3) Son çarə: yt-dlp 'ytsearch5:'
+    • COOKIES_B64 varsa – hər iki yükləmədə istifadə olunur (YouTube blokunu keçir)
     Geri: (mp3_path, title, artist, tmpdir)
     """
+    import base64
+
     tmpdir = tempfile.mkdtemp(prefix="track_")
     outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
+
+    # cookies.txt hazırlığı (əgər COOKIES_B64 var)
+    cookie_path = None
+    if COOKIES_B64:
+        cookie_path = os.path.join(tmpdir, "cookies.txt")
+        with open(cookie_path, "wb") as f:
+            f.write(base64.b64decode(COOKIES_B64))
 
     def find_mp3_path() -> str:
         for name in os.listdir(tmpdir):
@@ -93,8 +106,12 @@ def download_track(query: str):
                 {"key": "FFmpegMetadata"},
             ],
         }
+        if cookie_path:
+            ydl_opts["cookiefile"] = cookie_path
+
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
+
         mp3_path = find_mp3_path()
         if not mp3_path:
             raise RuntimeError("MP3 faylı yaradılmadı")
@@ -170,12 +187,16 @@ def download_track(query: str):
                 {"key": "FFmpegMetadata"},
             ],
         }
+        if cookie_path:
+            ydl_opts["cookiefile"] = cookie_path
+
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(query, download=True)
             if info.get("_type") == "playlist" and info.get("entries"):
                 info = info["entries"][0]
             title = info.get("title") or "Naməlum Mahnı"
             artist = info.get("artist") or info.get("uploader") or "Naməlum"
+
         mp3_path = find_mp3_path()
         if not mp3_path:
             raise RuntimeError("MP3 faylı çıxmadı")
@@ -211,6 +232,7 @@ async def on_query(m: Message):
         f"👤 Göndərən: @{m.from_user.username or m.from_user.id}"
     )
 
+    # Faylı ilk adminə göndər, file_id götür
     first_admin = ADMIN_IDS[0]
     try:
         msg = await bot.send_audio(first_admin, FSInputFile(file_path), caption=caption)
@@ -223,6 +245,7 @@ async def on_query(m: Message):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    # DB-yə yaz
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO submissions (user_id, username, query, file_id, title, artist) VALUES (?, ?, ?, ?, ?, ?)",
