@@ -1,376 +1,126 @@
 import os
 import asyncio
-import aiosqlite
-import tempfile
-import shutil
-import requests
-from dataclasses import dataclass
-from contextlib import suppress
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from typing import Tuple, Optional
+
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import MessageNotModified
+
+from youtubesearchpython import VideosSearch
 from yt_dlp import YoutubeDL
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+# ==== ENV ====
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# İstəyə bağlı: Öz Heroku proxy API-nin URL-i (məs: https://sənin-proxy.herokuapp.com)
-PROXY_API_URL = os.getenv("PROXY_API_URL", "").strip()
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise SystemExit("API_ID, API_HASH və BOT_TOKEN dəyişənlərini Heroku Config Vars-da qurun.")
 
-# Bir neçə admin üçün (vergüllə ayrılmış ID-lər, məsələn "123456789,987654321")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+# ==== Pyrogram Client ====
+app = Client("music_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-if not BOT_TOKEN or not CHANNEL_ID or not ADMIN_IDS:
-    raise SystemExit("BOT_TOKEN, CHANNEL_ID və ADMIN_IDS (vergüllə ayrılmış) dəyişənlərini qurun.")
+# Yükləmələr üçün qovluq
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-DB_PATH = "submissions.db"
+HELP_TEXT = (
+    "__Mahnı adı qeyd edin...__\n\n"
+    "Nümunə: ```/song Miro Təcili Yardım```"
+)
 
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS submissions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    username TEXT,
-    query TEXT NOT NULL,
-    file_id TEXT NOT NULL,
-    title TEXT,
-    artist TEXT,
-    status TEXT NOT NULL DEFAULT 'pending'
-);
-"""
+def search_youtube(query: str) -> Optional[str]:
+    """Sorğuya görə birinci video linkini qaytarır."""
+    try:
+        r = VideosSearch(query, limit=1).result()
+        if r.get("result"):
+            return r["result"][0]["link"]
+    except Exception:
+        pass
+    return None
 
-@dataclass
-class Submission:
-    id: int
-    user_id: int
-    username: str | None
-    query: str
-    file_id: str
-    title: str | None
-    artist: str | None
-    status: str
-
-def admin_kb(sub_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Qəbul", callback_data=f"approve:{sub_id}"),
-        InlineKeyboardButton(text="❌ Rədd", callback_data=f"reject:{sub_id}")
-    ]])
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(CREATE_SQL)
-        await db.commit()
-
-# -----------------------------------------------------------
-# MAHNI YÜKLƏMƏ — Proxy → Piped/Invidious → YouTube axtarış (filtr + fallback)
-# -----------------------------------------------------------
-def download_track(query: str):
+def download_mp3(video_url: str) -> Tuple[str, str, str, int]:
     """
-    1) PROXY_API_URL varsa: <proxy>/api/search?query=...
-    2) Piped/Invidious instansları (yalnız JSON cavablıları qəbul edir)
-    3) Son çarə: yt-dlp 'ytsearch10' — nəticələri filtrlə (15s–12dq, shorts deyil) və bir-bir yoxla
-    Geri: (mp3_path, title, artist, tmpdir)
+    Verilən YouTube linkindən MP3 çıxarır.
+    Qaytarır: (mp3_path, title, author, duration)
     """
-    tmpdir = tempfile.mkdtemp(prefix="track_")
-    outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
+    outtmpl = os.path.join(DOWNLOAD_DIR, "%(title).200B [%(id)s].%(ext)s")
 
-    def find_mp3_path() -> str:
-        for name in os.listdir(tmpdir):
-            if name.lower().endswith(".mp3"):
-                return os.path.join(tmpdir, name)
-        return ""
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "geo_bypass": True,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+            {"key": "FFmpegMetadata"},
+        ],
+    }
 
-    def build_cookiefile() -> str | None:
-        # Termux-da yaratdığın cookies.b64 dəyərini Heroku-da Config Vars → COOKIES_B64 kimi qoysan, buradan oxunacaq
-        b64 = os.getenv("COOKIES_B64", "").strip()
-        if not b64:
-            return None
-        p = os.path.join(tmpdir, "cookies.txt")
-        try:
-            import base64
-            with open(p, "wb") as f:
-                f.write(base64.b64decode(b64))
-            return p
-        except Exception as e:
-            print(f"[cookies decode error] {e}")
-            return None
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
 
-    def ytdlp_try(url: str, title_fallback="Naməlum Mahnı", author_fallback="Naməlum"):
-        cookies_path = build_cookiefile()
-        common_opts = {
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "noplaylist": True,
-            "geo_bypass": True,
-            "nocheckcertificate": True,
-            "allow_unplayable_formats": False,
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-                {"key": "FFmpegMetadata"},
-            ],
-        }
-        if cookies_path:
-            common_opts["cookiefile"] = cookies_path
+        # Faylın yolunu qur
+        base = ydl.prepare_filename(info)
+        mp3_path = os.path.splitext(base)[0] + ".mp3"
 
-        probe_opts = dict(common_opts)
-        probe_opts["skip_download"] = True
-        probe_opts["format"] = "bestaudio/best"
-
-        with YoutubeDL(probe_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        if not info or ("shorts/" in (info.get("webpage_url") or "")):
-            raise RuntimeError("Uyğun olmayan nəticə (shorts və ya səhifə)")
-
-        fmts = info.get("formats") or []
-        audio_only = [f for f in fmts if (f.get("vcodec") in (None, "none")) and (f.get("acodec") and f.get("acodec") != "none")]
-
-        if not audio_only:
-            audio_like = [f for f in fmts if f.get("acodec") and f.get("acodec") != "none"]
-            if not audio_like:
-                raise RuntimeError("Audio format tapılmadı")
-            best = max(audio_like, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
-        else:
-            best = max(audio_only, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
-
-        forced_format_id = best.get("format_id")
-        if not forced_format_id:
-            raise RuntimeError("Format ID tapılmadı")
-
-        dl_opts = dict(common_opts)
-        dl_opts["format"] = f"{forced_format_id}"
-
-        with YoutubeDL(dl_opts) as ydl:
-            ydl.download([url])
-
-        for name in os.listdir(tmpdir):
-            if name.lower().endswith(".mp3"):
-                mp3_path = os.path.join(tmpdir, name)
-                break
-        else:
+        if not os.path.exists(mp3_path):
             raise RuntimeError("MP3 faylı yaradılmadı")
 
-        return mp3_path, title_fallback, author_fallback, tmpdir
+        title = info.get("title") or "Naməlum Mahnı"
+        author = info.get("artist") or info.get("uploader") or "Naməlum"
+        duration = int(info.get("duration") or 0)
+        return mp3_path, title, author, duration
 
-    # 1) PROXY varsa
-    if PROXY_API_URL:
-        try:
-            api = PROXY_API_URL.rstrip("/") + "/api/search"
-            url = f"{api}?query={requests.utils.quote(query)}"
-            r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-            if r.ok:
-                j = r.json()
-                if "url" in j:
-                    print(f"[PROXY OK] {j.get('source','')}")
-                    return ytdlp_try(j["url"], j.get("title","Naməlum Mahnı"), j.get("author","Naməlum"))
-            else:
-                print(f"[PROXY FAIL] status={r.status_code}")
-        except Exception as e:
-            print(f"[PROXY ERROR] {e}")
+@app.on_message(filters.command(["start"]))
+async def start_handler(_, m: Message):
+    await m.reply("Salam! /song ilə mahnı adını yaz, mən tapıb MP3 göndərim 🎧\n\n" + HELP_TEXT, quote=True)
 
-    # 2) Piped / Invidious instansları
-    SOURCES = [
-        ("piped", "https://piped.video"),
-        ("piped", "https://pipedapi.kavin.rocks"),
-        ("piped", "https://piped.mha.fi"),
-        ("invidious", "https://iv.ggtyler.dev"),
-        ("invidious", "https://yewtu.be"),
-    ]
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+@app.on_message(filters.command(["song"], prefixes=["/", "!"]) & (filters.private | filters.group) & ~filters.edited)
+async def song_handler(_, m: Message):
+    if len(m.command) == 1:
+        return await m.reply(HELP_TEXT, quote=True)
 
-    for typ, base in SOURCES:
-        try:
-            if typ == "invidious":
-                req = f"{base}/api/v1/search?q={requests.utils.quote(query)}"
-            else:
-                req = f"{base}/api/v1/search?q={requests.utils.quote(query)}&filter=music"
+    query = m.text.split(None, 1)[1].strip()
+    status = await m.reply("<b>🔍 Mahnı axtarılır...</b>", quote=True)
 
-            resp = requests.get(req, timeout=10, headers=headers)
-            ct = resp.headers.get("content-type", "")
-            if not resp.ok or "application/json" not in ct.lower():
-                print(f"[{base}] JSON deyil və/ya status {resp.status_code}")
-                continue
-
-            data = resp.json()
-            item = data[0] if isinstance(data, list) and data else (data if data else None)
-            if not item:
-                continue
-
-            title = item.get("title") or "Naməlum Mahnı"
-            artist = item.get("uploader") or item.get("author") or "Naməlum"
-            video_url = (
-                f"https://youtube.com/watch?v={item.get('videoId')}"
-                if "videoId" in item else f"{base}{item.get('url')}"
-            )
-            if "shorts/" in video_url:  # Shorts-ları atla
-                continue
-            return ytdlp_try(video_url, title, artist)
-        except Exception as e:
-            print(f"[{base}] xətası: {e}")
-            continue
-
-    # 3) Son çarə: birbaşa YouTube axtarışı — nəticələri filtrlə və sırayla yoxla
-    try:
-        cookies_path = build_cookiefile()
-        search_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "quiet": True,
-            "default_search": "ytsearch10",
-            "geo_bypass": True,
-            "nocheckcertificate": True,
-            "http_headers": {"User-Agent": "Mozilla/5.0"},
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-                {"key": "FFmpegMetadata"},
-            ],
-        }
-        if cookies_path:
-            search_opts["cookiefile"] = cookies_path
-
-        with YoutubeDL(search_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-
-        entries = []
-        if info:
-            if info.get("_type") == "playlist":
-                entries = [e for e in info.get("entries", []) if e]
-            else:
-                entries = [info]
-
-        # Filtr: 15s–12dq, URL-də shorts olmasın
-        candidates = []
-        for e in entries:
-            dur = (e.get("duration") or 0)
-            url = e.get("webpage_url") or e.get("url") or ""
-            if 15 <= dur <= 12 * 60 and "shorts/" not in url:
-                candidates.append(e)
-        if not candidates:
-            candidates = entries  # heç nə düşmədinsə, hamısını cəhd et
-
-        last_err = None
-        for e in candidates:
-            try:
-                url = e.get("webpage_url") or e.get("url")
-                title = e.get("title") or "Naməlum Mahnı"
-                artist = e.get("artist") or e.get("uploader") or "Naməlum"
-                return ytdlp_try(url, title, artist)
-            except Exception as ex:
-                last_err = ex
-                continue
-
-        raise RuntimeError(last_err or "Uyğun format tapılmadı")
-    except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError(f"Mahnı tapılmadı — bütün mənbələr uğursuz oldu: {e}")
-
-# ----------------------- Handlers -----------------------
-
-@dp.message(CommandStart())
-async def start(m: Message):
-    await m.answer("Salam! Mahnı adı yaz, mən onu tapım və adminlərə göndərim 🎧")
-
-@dp.message(F.text & ~F.via_bot)
-async def on_query(m: Message):
-    query = m.text.strip()
-    if not query:
-        return await m.answer("Zəhmət olmasa mahnı adını yazın 🎵")
-    wait = await m.answer("Axtarıram və yükləyirəm... ⏳")
+    url = search_youtube(query)
+    if not url:
+        return await status.edit("❌ Mahnı tapılmadı. Yenidən cəhd edin...")
 
     try:
-        file_path, title, artist, tmpdir = await asyncio.to_thread(download_track, query)
+        await status.edit("<b>⏬ Yüklənilir...</b>")
+        mp3_path, title, author, duration = download_mp3(url)
     except Exception as e:
-        print(f"[download_track error] {e}")
-        await wait.edit_text("Tapmaq mümkün olmadı. ❌  (fərqli adla yenidən yoxla)")
+        try:
+            await status.edit(f"❌ Xəta: {e}")
+        except MessageNotModified:
+            pass
         return
 
-    caption = (
-        f"🎶 Yeni tövsiyə\n"
-        f"📌 Axtarış: {query}\n"
-        f"🎵 Başlıq: {title or '—'}\n"
-        f"👤 Göndərən: @{m.from_user.username or m.from_user.id}"
-    )
-
-    first_admin = ADMIN_IDS[0]
     try:
-        msg = await bot.send_audio(first_admin, FSInputFile(file_path), caption=caption)
-        file_id = msg.audio.file_id
-    except Exception as e:
-        print(f"[send_audio first_admin error] {e}")
-        await wait.edit_text("Admin PM-ə göndərmək alınmadı ❌")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        await status.edit("<b>📤 Göndərilir...</b>")
+    except MessageNotModified:
+        pass
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO submissions (user_id, username, query, file_id, title, artist) VALUES (?, ?, ?, ?, ?, ?)",
-            (m.from_user.id, m.from_user.username, query, file_id, title, artist)
+    try:
+        await m.reply_audio(
+            audio=mp3_path,
+            duration=duration or None,
+            performer=author,
+            title=title,
+            caption=f"<b>{title}</b>\n\n<b>Yüklədi:</b> @MusicAzeribaycan"
         )
-        await db.commit()
-        cur = await db.execute("SELECT last_insert_rowid()")
-        sub_id = (await cur.fetchone())[0]
+    finally:
+        # Faylı sil
+        try:
+            os.remove(mp3_path)
+        except Exception:
+            pass
 
-    # bütün adminlərə PM
-    for admin_id in ADMIN_IDS:
-        with suppress(Exception):
-            await bot.send_audio(
-                admin_id,
-                file_id,
-                caption=caption + f"\nID: #{sub_id}",
-                title=title or query,
-                performer=artist or "",
-                reply_markup=admin_kb(sub_id)
-            )
-
-    await wait.edit_text("Tövsiyəniz adminlərə göndərildi ✅")
-
-@dp.callback_query(F.from_user.id.in_(ADMIN_IDS), F.data.startswith(("approve:", "reject:")))
-async def on_moderate(cb: CallbackQuery):
-    action, sub_id_str = cb.data.split(":")
-    sub_id = int(sub_id_str)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM submissions WHERE id = ?", (sub_id,))
-        row = await cur.fetchone()
-        if not row:
-            return await cb.answer("Tapılmadı.", show_alert=True)
-        sub = Submission(**row)
-
-        if sub.status != "pending":
-            return await cb.answer("Artıq emal olunub.", show_alert=True)
-
-        if action == "approve":
-            cap = f"{sub.title or sub.query}\n#MusicAzerbaycan #Tövsiyə"
-            await bot.send_audio(CHANNEL_ID, sub.file_id, caption=cap)
-            await db.execute("UPDATE submissions SET status='approved' WHERE id=?", (sub.id,))
-            await db.commit()
-            await cb.answer("✅ Qəbul edildi")
-            with suppress(Exception):
-                await cb.message.edit_caption(cb.message.caption + "\n✅ Qəbul olundu")
-            with suppress(Exception):
-                await bot.send_message(sub.user_id, "✅ Tövsiyən qəbul olundu və kanala paylaşıldı.")
-        else:
-            await db.execute("UPDATE submissions SET status='rejected' WHERE id=?", (sub.id,))
-            await db.commit()
-            await cb.answer("❌ Rədd edildi")
-            with suppress(Exception):
-                await cb.message.edit_caption(cb.message.caption + "\n❌ Rədd edildi")
-            with suppress(Exception):
-                await bot.send_message(sub.user_id, "❌ Təəssüf, tövsiyəniz rədd edildi.")
-
-# ----------------------- Runner -----------------------
-
-async def main():
-    await init_db()
-    await dp.start_polling(bot)
+    with contextlib.suppress(Exception):
+        await status.delete()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run()
