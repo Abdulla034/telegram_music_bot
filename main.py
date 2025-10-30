@@ -60,32 +60,41 @@ async def init_db():
         await db.commit()
 
 
-# ✅ Yeni versiya: cookies-siz və YouTube-un alternativ API-si ilə
+# ✅ Yeni stabil versiya — 3 alternativ mənbədən mahnı tapır
 def download_track(query: str):
     """
-    Cookies tələb etmir. YouTube videolarını piped.video API ilə tapır və yükləyir.
-    Heroku-da sabit işləyir.
+    YouTube videolarını cookies-siz alternativ API-lərdən tapır və yükləyir.
+    3 fərqli piped serveri sınayır.
     """
     tmpdir = tempfile.mkdtemp(prefix="track_")
     outtmpl = os.path.join(tmpdir, "audio.mp3")
 
-    # piped.video API ilə axtarış
-    search_url = f"https://piped.video/api/v1/search?q={query}&filter=music"
-    resp = requests.get(search_url, timeout=10)
-    if resp.status_code != 200:
-        raise RuntimeError("Axtarış zamanı xəta baş verdi")
+    SOURCES = [
+        "https://piped.video",
+        "https://pipedapi.kavin.rocks",
+        "https://piped.mha.fi"
+    ]
 
-    results = resp.json()
-    if not results:
-        raise RuntimeError("Mahnı tapılmadı")
+    video = None
+    for base_url in SOURCES:
+        try:
+            resp = requests.get(f"{base_url}/api/v1/search?q={query}&filter=music", timeout=10)
+            if resp.status_code == 200 and resp.json():
+                video = resp.json()[0]
+                video_url = f"{base_url}{video['url']}"
+                print(f"[OK] Tapıldı: {video_url}")
+                break
+        except Exception as e:
+            print(f"[{base_url}] xətası: {e}")
+            continue
 
-    # İlk nəticəni götür
-    video = results[0]
-    video_url = f"https://piped.video{video['url']}"
+    if not video:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("Mahnı tapılmadı — bütün mənbələr uğursuz oldu")
+
     title = video.get("title")
     author = video.get("uploader") or "Naməlum"
 
-    # yt-dlp ilə yükləmə
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
