@@ -59,28 +59,62 @@ async def init_db():
         await db.commit()
 
 def download_track(query: str):
-    """yt-dlp ilə 'ytsearch1:<query>' axtarır, ən yaxşı audioyu MP3 kimi çıxarır."""
+    """
+    YouTube/YouTube Music-də axtarır, ən uyğun nəticəni MP3 kimi çıxarır.
+    Geri: (mp3_path, title, artist, tmpdir)
+    """
     tmpdir = tempfile.mkdtemp(prefix="track_")
     outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
+
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
-        "default_search": "ytsearch1",
+        "default_search": "ytsearch5",      # daha stabil
+        "geo_bypass": True,
+        "source_address": "0.0.0.0",
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-            {"key": "FFmpegMetadata"}
+            {"key": "FFmpegMetadata"},
         ],
     }
+
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=True)
-        if "_type" in info and info["_type"] == "playlist" and info["entries"]:
-            info = info["entries"][0]
-        title = info.get("title")
-        artist = info.get("artist") or info.get("uploader") or ""
-        base = ydl.prepare_filename(info)
+        info = ydl.extract_info(query, download=False)
+
+        # ytsearch nəticəsidirsə entries-lərdən seç
+        if info.get("_type") == "playlist":
+            entries = [e for e in info.get("entries", []) if e]
+            if not entries:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise RuntimeError("axtarış nəticəsi tapılmadı")
+
+            # 15s-12dq aralığında olanları saxla
+            filtered = []
+            for e in entries:
+                dur = (e.get("duration") or 0)
+                if 15 <= dur <= 12 * 60:
+                    filtered.append(e)
+            if not filtered:
+                filtered = entries
+
+            chosen = filtered[0]
+        else:
+            chosen = info
+
+        # Seçilən videonu yüklə
+        info2 = ydl.extract_info(chosen["webpage_url"], download=True)
+        title = info2.get("title")
+        artist = info2.get("artist") or info2.get("uploader") or ""
+
+        base = ydl.prepare_filename(info2)
         mp3_path = os.path.splitext(base)[0] + ".mp3"
+
+        if not os.path.exists(mp3_path):
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError("ffmpeg və ya fayl çıxarma xətası")
+
         return mp3_path, title, artist, tmpdir
 
 @dp.message(CommandStart())
@@ -96,8 +130,10 @@ async def on_query(m: Message):
 
     try:
         file_path, title, artist, tmpdir = await asyncio.to_thread(download_track, query)
-    except Exception:
-        await wait.edit_text("Tapmaq mümkün olmadı. ❌")
+    except Exception as e:
+        # Loglarda dəqiq səbəbi görmək üçün:
+        print(f"[download_track error] {e}")
+        await wait.edit_text("Tapmaq mümkün olmadı. ❌  (yt-dlp/ffmpeg və ya nəticə yoxdur)")
         return
 
     caption = (
@@ -113,6 +149,7 @@ async def on_query(m: Message):
         msg = await bot.send_audio(first_admin, FSInputFile(file_path), caption=caption)
         file_id = msg.audio.file_id
     except Exception as e:
+        print(f"[send_audio first_admin error] {e}")
         await wait.edit_text("Admin PM-ə göndərmək alınmadı ❌")
         shutil.rmtree(tmpdir, ignore_errors=True)
         return
@@ -128,7 +165,7 @@ async def on_query(m: Message):
         cur = await db.execute("SELECT last_insert_rowid()")
         sub_id = (await cur.fetchone())[0]
 
-    # Adminlərə mesaj
+    # Adminlərə mesaj (hamısına PM)
     for admin_id in ADMIN_IDS:
         with suppress(Exception):
             await bot.send_audio(
@@ -164,14 +201,16 @@ async def on_moderate(cb: CallbackQuery):
             await db.execute("UPDATE submissions SET status='approved' WHERE id=?", (sub.id,))
             await db.commit()
             await cb.answer("✅ Qəbul edildi")
-            await cb.message.edit_caption(cb.message.caption + "\n✅ Qəbul olundu")
+            with suppress(Exception):
+                await cb.message.edit_caption(cb.message.caption + "\n✅ Qəbul olundu")
             with suppress(Exception):
                 await bot.send_message(sub.user_id, "✅ Tövsiyən qəbul olundu və kanala paylaşıldı.")
         else:
             await db.execute("UPDATE submissions SET status='rejected' WHERE id=?", (sub.id,))
             await db.commit()
             await cb.answer("❌ Rədd edildi")
-            await cb.message.edit_caption(cb.message.caption + "\n❌ Rədd edildi")
+            with suppress(Exception):
+                await cb.message.edit_caption(cb.message.caption + "\n❌ Rədd edildi")
             with suppress(Exception):
                 await bot.send_message(sub.user_id, "❌ Təəssüf, tövsiyəniz rədd edildi.")
 
