@@ -1,5 +1,5 @@
 import os
-import asyncio
+import contextlib
 from typing import Tuple, Optional
 
 from pyrogram import Client, filters
@@ -52,6 +52,10 @@ def download_mp3(video_url: str) -> Tuple[str, str, str, int]:
         "noplaylist": True,
         "quiet": True,
         "geo_bypass": True,
+        "nocheckcertificate": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+        # “Requested format is not available” üçün alternativ client
+        "extractor_args": {"youtube": {"player_client": ["android", "tvhtml5"]}},
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
             {"key": "FFmpegMetadata"},
@@ -60,8 +64,6 @@ def download_mp3(video_url: str) -> Tuple[str, str, str, int]:
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=True)
-
-        # Faylın yolunu qur
         base = ydl.prepare_filename(info)
         mp3_path = os.path.splitext(base)[0] + ".mp3"
 
@@ -75,11 +77,12 @@ def download_mp3(video_url: str) -> Tuple[str, str, str, int]:
 
 @app.on_message(filters.command(["start"]))
 async def start_handler(_, m: Message):
-    await m.reply("Salam! /song ilə mahnı adını yaz, mən tapıb MP3 göndərim 🎧\n\n" + HELP_TEXT, quote=True)
+    await m.reply(
+        "Salam! /song ilə mahnı adını yaz, mən tapıb MP3 göndərim 🎧\n\n" + HELP_TEXT,
+        quote=True
+    )
 
-@app.on_message(
-    filters.command(['song'], prefixes=['/', '!'])
-    & (filters.group | filters.private))
+@app.on_message(filters.command(['song'], prefixes=['/', '!']) & (filters.group | filters.private))
 async def song_handler(_, m: Message):
     if len(m.command) == 1:
         return await m.reply(HELP_TEXT, quote=True)
@@ -95,16 +98,12 @@ async def song_handler(_, m: Message):
         await status.edit("<b>⏬ Yüklənilir...</b>")
         mp3_path, title, author, duration = download_mp3(url)
     except Exception as e:
-        try:
+        with contextlib.suppress(MessageNotModified):
             await status.edit(f"❌ Xəta: {e}")
-        except MessageNotModified:
-            pass
         return
 
-    try:
+    with contextlib.suppress(MessageNotModified):
         await status.edit("<b>📤 Göndərilir...</b>")
-    except MessageNotModified:
-        pass
 
     try:
         await m.reply_audio(
@@ -112,14 +111,11 @@ async def song_handler(_, m: Message):
             duration=duration or None,
             performer=author,
             title=title,
-            caption=f"<b>{title}</b>\n\n<b>Yüklədi:</b> @MusicAzeribaycan"
+            caption=f"<b>{title}</b>\n\n<b>Yüklədi:</b> @MusicAzerbaycan"
         )
     finally:
-        # Faylı sil
-        try:
+        with contextlib.suppress(Exception):
             os.remove(mp3_path)
-        except Exception:
-            pass
 
     with contextlib.suppress(Exception):
         await status.delete()
